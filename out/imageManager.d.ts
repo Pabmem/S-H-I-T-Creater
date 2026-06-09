@@ -4,8 +4,9 @@ import * as vscode from 'vscode';
  * Scans an `images/` directory and provides fuzzy-matching lookup.
  */
 export declare class ImageManager {
-    private readonly imagesFolder;
+    private imagesFolder;
     private emotionMap;
+    private readonly defaultImagesFolder;
     constructor(context: vscode.ExtensionContext, customImagesFolder?: string);
     /**
      * Scan the images folder and build the emotion → absolute-path map.
@@ -20,6 +21,7 @@ export declare class ImageManager {
      * Return all available emotion labels (lowercase, as derived from filenames).
      */
     getAvailableEmotions(): string[];
+    setImagesFolder(customImagesFolder?: string): Promise<void>;
     /**
      * Check whether an emotion image exists (uses the same fuzzy logic).
      */
@@ -28,6 +30,7 @@ export declare class ImageManager {
      * Normalize an emotion string: lowercase, replace underscores/hyphens with spaces.
      */
     private normalizeEmotion;
+    private resolveImagesFolder;
     /**
      * Apply well-known fuzzy alias mappings.
      * Returns the canonical label if a match is found, otherwise `undefined`.

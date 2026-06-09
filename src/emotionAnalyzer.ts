@@ -32,9 +32,11 @@ export class EmotionAnalyzer implements vscode.Disposable {
             return DEFAULT_EMOTION;
         }
 
-        const startLine = Math.max(0, document.lineCount - this.linesToAnalyze);
+        const cursorLine = editor.selection.active.line;
+        const endLine = Math.min(document.lineCount - 1, cursorLine);
+        const startLine = Math.max(0, endLine - this.linesToAnalyze + 1);
         const recentCode = document.getText(
-            new vscode.Range(startLine, 0, document.lineCount - 1, document.lineAt(document.lineCount - 1).text.length)
+            new vscode.Range(startLine, 0, endLine, document.lineAt(endLine).text.length)
         );
 
         if (!recentCode.trim()) {
@@ -44,7 +46,6 @@ export class EmotionAnalyzer implements vscode.Disposable {
         try {
             const [model] = await vscode.lm.selectChatModels({
                 vendor: 'copilot',
-                family: 'gpt-4o',
             });
 
             if (!model) {
@@ -108,10 +109,10 @@ export class EmotionAnalyzer implements vscode.Disposable {
         ).length;
 
         if (errorCount > 5) {
-            return 'angry';
+            return 'sad';
         }
         if (errorCount > 2) {
-            return 'sad';
+            return 'angry';
         }
         if (errorCount > 0) {
             return 'angry and cool';

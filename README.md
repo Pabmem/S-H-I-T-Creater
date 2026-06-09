@@ -18,13 +18,14 @@
   | `wdf` | 困惑 | 完全看不懂在写什么 |
 - 🔄 **平滑渐变切换**：图片切换时有 1.5 秒的淡入淡出动画
 - ⚡ **实时更新**：定时分析（默认30秒）+ 文件保存时立即分析
-- 🛡️ **安全恢复**：退出时自动恢复 VS Code 原始样式
+- 🛡️ **安全渲染**：使用编辑器装饰层显示背景，不修改 VS Code 安装目录
 
 ## 📦 安装与使用
 
 ### 开发模式
 ```bash
 npm install
+npm run self-check
 npm run compile
 # 按 F5 启动 Extension Development Host
 ```
@@ -70,15 +71,14 @@ images/
 
 - 需要安装 [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) 扩展以使用 LLM 分析功能
 - 如果 Copilot 不可用，会自动降级为基于代码诊断的规则分析
-- CSS 注入方式会修改 VS Code 核心文件，标题栏可能显示 "[不受支持]" 警告
-- 禁用插件或按 `Mood Background: Disable` 后会自动恢复原文件
+- 插件只在可见文本编辑器中渲染背景，禁用后会立即清理装饰层
 
 ## 📁 项目结构
 
 ```
 ├── src/
 │   ├── extension.ts          # 插件入口
-│   ├── cssInjector.ts        # CSS 注入/恢复
+│   ├── cssInjector.ts        # 安全背景装饰层
 │   ├── emotionAnalyzer.ts    # LLM 情绪分析
 │   ├── imageManager.ts       # 图片管理
 │   └── backgroundRenderer.ts # 渐变渲染

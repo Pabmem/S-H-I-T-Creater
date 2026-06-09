@@ -47,12 +47,12 @@ const cssInjector_1 = __webpack_require__(5);
 const emotionAnalyzer_1 = __webpack_require__(6);
 const backgroundRenderer_1 = __webpack_require__(7);
 let refreshTimer;
+let editRefreshTimer;
 let cssInjectorInstance;
 async function activate(context) {
     try {
         const config = vscode.workspace.getConfiguration('moodBackground');
         let enabled = config.get('enabled', true);
-        // Create core instances
         const imageManager = new imageManager_1.ImageManager(context, config.get('imagesFolder', ''));
         await imageManager.scanImages();
         const cssInjector = new cssInjector_1.CssInjector(config.get('opacity', 0.15), config.get('transitionDuration', 1.5));
@@ -60,17 +60,9 @@ async function activate(context) {
         let analyzer = new emotionAnalyzer_1.EmotionAnalyzer(config.get('linesToAnalyze', 20));
         const renderer = new backgroundRenderer_1.BackgroundRenderer(cssInjector);
         renderer.setTransitionDuration(config.get('transitionDuration', 1.5) * 1000);
-        // Inject CSS on startup if enabled
+        context.subscriptions.push(cssInjector, renderer, analyzer);
         if (enabled) {
-            console.log('[MoodBackground] Applying background...');
             cssInjector.inject();
-            console.log('[MoodBackground] Background applied. isInjected:', cssInjector.isInjected());
-            // CSS 修改后需要重新加载窗口才能生效
-            vscode.window.showInformationMessage('Mood Background 已安装！需要重新加载窗口才能看到背景图片。', '重新加载').then(choice => {
-                if (choice === '重新加载') {
-                    vscode.commands.executeCommand('workbench.action.reloadWindow');
-                }
-            });
         }
         // ── Status bar ──────────────────────────────────────────
         const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -84,31 +76,37 @@ async function activate(context) {
         // ── Refresh logic ───────────────────────────────────────
         async function refreshEmotion() {
             if (!enabled) {
-                console.log('[MoodBackground] refreshEmotion: disabled, skipping');
                 return;
             }
             try {
-                console.log('[MoodBackground] Analyzing emotion...');
                 const emotion = await analyzer.analyze();
-                console.log('[MoodBackground] Emotion result:', emotion);
                 const imagePath = imageManager.getImageForEmotion(emotion);
-                console.log('[MoodBackground] Image path for', emotion, ':', imagePath);
-                console.log('[MoodBackground] Available emotions:', imageManager.getAvailableEmotions());
                 if (imagePath) {
                     renderer.switchTo(imagePath, emotion);
-                    console.log('[MoodBackground] Renderer.switchTo called');
-                    // CSS 文件修改后需要重新加载窗口才能生效
-                    vscode.window.showInformationMessage(`情绪已切换为: ${emotion}`, '重新加载以查看').then(choice => {
-                        if (choice === '重新加载以查看') {
-                            vscode.commands.executeCommand('workbench.action.reloadWindow');
-                        }
-                    });
+                }
+                else {
+                    const fallbackImage = imageManager.getImageForEmotion('happy');
+                    if (fallbackImage) {
+                        renderer.switchTo(fallbackImage, 'happy');
+                    }
                 }
                 statusBar.text = `$(paintcan) Mood: ${emotion}`;
             }
             catch (err) {
                 console.error('[MoodBackground] refreshEmotion error:', err);
             }
+        }
+        function scheduleEditRefresh() {
+            if (!enabled) {
+                return;
+            }
+            if (editRefreshTimer !== undefined) {
+                clearTimeout(editRefreshTimer);
+            }
+            editRefreshTimer = setTimeout(() => {
+                editRefreshTimer = undefined;
+                refreshEmotion();
+            }, 3000);
         }
         // ── Timer helpers ───────────────────────────────────────
         function startTimer() {
@@ -137,6 +135,10 @@ async function activate(context) {
             cssInjector.restore();
             statusBar.hide();
             stopTimer();
+            if (editRefreshTimer !== undefined) {
+                clearTimeout(editRefreshTimer);
+                editRefreshTimer = undefined;
+            }
         }));
         context.subscriptions.push(vscode.commands.registerCommand('moodBackground.toggle', async () => {
             if (enabled) {
@@ -154,6 +156,18 @@ async function activate(context) {
         context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(() => {
             refreshEmotion();
         }));
+        context.subscriptions.push(vscode.workspace.onDidChangeTextDocument((event) => {
+            if (event.document === vscode.window.activeTextEditor?.document) {
+                scheduleEditRefresh();
+            }
+        }));
+        context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => {
+            cssInjector.applyToVisibleEditors();
+            scheduleEditRefresh();
+        }));
+        context.subscriptions.push(vscode.window.onDidChangeVisibleTextEditors(() => {
+            cssInjector.applyToVisibleEditors();
+        }));
         // React to configuration changes
         context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(async (e) => {
             const cfg = vscode.workspace.getConfiguration('moodBackground');
@@ -164,7 +178,9 @@ async function activate(context) {
                 }
             }
             if (e.affectsConfiguration('moodBackground.transitionDuration')) {
-                renderer.setTransitionDuration(cfg.get('transitionDuration', 1.5) * 1000);
+                const duration = cfg.get('transitionDuration', 1.5);
+                renderer.setTransitionDuration(duration * 1000);
+                cssInjector.updateTransitionDuration(duration);
             }
             if (e.affectsConfiguration('moodBackground.updateInterval')) {
                 if (enabled) {
@@ -181,7 +197,12 @@ async function activate(context) {
                 }
             }
             if (e.affectsConfiguration('moodBackground.linesToAnalyze')) {
+                analyzer.dispose();
                 analyzer = new emotionAnalyzer_1.EmotionAnalyzer(cfg.get('linesToAnalyze', 20));
+                await refreshEmotion();
+            }
+            if (e.affectsConfiguration('moodBackground.imagesFolder')) {
+                await imageManager.setImagesFolder(cfg.get('imagesFolder', ''));
                 await refreshEmotion();
             }
         }));
@@ -260,10 +281,10 @@ const fs = __importStar(__webpack_require__(4));
 class ImageManager {
     imagesFolder;
     emotionMap = new Map();
+    defaultImagesFolder;
     constructor(context, customImagesFolder) {
-        this.imagesFolder = (customImagesFolder && customImagesFolder.trim())
-            ? customImagesFolder
-            : context.asAbsolutePath('images');
+        this.defaultImagesFolder = context.asAbsolutePath('images');
+        this.imagesFolder = this.resolveImagesFolder(customImagesFolder);
     }
     /**
      * Scan the images folder and build the emotion → absolute-path map.
@@ -332,6 +353,10 @@ class ImageManager {
     getAvailableEmotions() {
         return Array.from(this.emotionMap.keys());
     }
+    async setImagesFolder(customImagesFolder) {
+        this.imagesFolder = this.resolveImagesFolder(customImagesFolder);
+        await this.scanImages();
+    }
     /**
      * Check whether an emotion image exists (uses the same fuzzy logic).
      */
@@ -347,6 +372,11 @@ class ImageManager {
             .toLowerCase()
             .replace(/[_-]+/g, ' ')
             .trim();
+    }
+    resolveImagesFolder(customImagesFolder) {
+        return (customImagesFolder && customImagesFolder.trim())
+            ? customImagesFolder.trim()
+            : this.defaultImagesFolder;
     }
     /**
      * Apply well-known fuzzy alias mappings.
@@ -426,76 +456,35 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.CssInjector = void 0;
 const vscode = __importStar(__webpack_require__(1));
-const path = __importStar(__webpack_require__(3));
-const fs = __importStar(__webpack_require__(4));
 /**
- * CssInjector — 通过修改 VS Code 的 workbench CSS 文件注入背景图片
- *
- * 这是业界标准方案（vscode-background 等插件均使用此方式）。
- * 安全保障：
- *   1. 注入前自动备份原始 CSS 文件（.backup）
- *   2. 通过唯一标记注释识别注入块，避免重复注入
- *   3. 禁用/卸载时自动从备份恢复
- *   4. dispose() 时自动清理
+ * CssInjector — uses VS Code editor decorations as a safe wallpaper layer.
+ * It deliberately avoids modifying VS Code installation files, so enabling or
+ * disabling the extension cannot corrupt the user's production editor install.
  */
 class CssInjector {
     opacity;
     transitionDuration;
-    cssPath = null;
     layerAImage = null;
     layerBImage = null;
     activeLayer = 'A';
     _isInjected = false;
-    static MARKER_START = '/* ── mood-background-start ── */';
-    static MARKER_END = '/* ── mood-background-end ── */';
+    layerADecoration;
+    layerBDecoration;
+    animationTimer;
+    framesPerSecond = 24;
     constructor(opacity = 0.15, transitionDuration = 1.5) {
         this.opacity = opacity;
         this.transitionDuration = transitionDuration;
     }
     // ── Public API ──────────────────────────────────────────────────────
     inject() {
-        try {
-            this.cssPath = this.resolveCssPath();
-            if (!this.cssPath) {
-                console.error('[mood-background] Could not locate workbench CSS file');
-                vscode.window.showWarningMessage('Mood Background: Cannot locate VS Code CSS file');
-                return;
-            }
-            if (!fs.existsSync(this.cssPath)) {
-                console.error('[mood-background] CSS file not found:', this.cssPath);
-                return;
-            }
-            this.backupIfNeeded();
-            this._isInjected = true;
-            this.reinject();
-            console.log('[mood-background] CSS injected successfully');
-        }
-        catch (err) {
-            console.error('[mood-background] inject failed:', err);
-        }
+        this._isInjected = true;
+        this.render();
     }
     restore() {
-        try {
-            if (!this.cssPath) {
-                this.cssPath = this.resolveCssPath();
-            }
-            if (!this.cssPath) {
-                return;
-            }
-            const backupPath = this.cssPath + '.mood-backup';
-            if (!fs.existsSync(backupPath)) {
-                // No backup — just strip our injected block
-                this.stripInjection();
-                return;
-            }
-            const backup = fs.readFileSync(backupPath, 'utf-8');
-            fs.writeFileSync(this.cssPath, backup, 'utf-8');
-            this._isInjected = false;
-            console.log('[mood-background] CSS restored from backup');
-        }
-        catch (err) {
-            console.error('[mood-background] restore failed:', err);
-        }
+        this.stopAnimation();
+        this.disposeDecorations();
+        this._isInjected = false;
     }
     isInjected() {
         return this._isInjected;
@@ -503,21 +492,18 @@ class CssInjector {
     updateOpacity(opacity) {
         this.opacity = opacity;
         if (this._isInjected) {
-            this.reinject();
+            this.render();
         }
     }
     updateTransitionDuration(duration) {
         this.transitionDuration = duration;
-        if (this._isInjected) {
-            this.reinject();
-        }
     }
     setInitialImage(imagePath) {
         this.layerAImage = imagePath;
         this.layerBImage = null;
         this.activeLayer = 'A';
         if (this._isInjected) {
-            this.reinject();
+            this.render();
         }
     }
     setCrossfadeImage(imagePath) {
@@ -528,151 +514,121 @@ class CssInjector {
             this.layerAImage = imagePath;
         }
         if (this._isInjected) {
-            this.reinject();
+            this.render(this.activeLayer === 'A' ? this.opacity : 0, this.activeLayer === 'B' ? this.opacity : 0);
         }
     }
     swapActiveLayer() {
+        const fromLayer = this.activeLayer;
         this.activeLayer = this.activeLayer === 'A' ? 'B' : 'A';
+        if (!this._isInjected) {
+            return;
+        }
+        this.animateCrossfade(fromLayer, this.activeLayer);
+    }
+    applyToVisibleEditors() {
         if (this._isInjected) {
-            this.reinject();
+            this.render();
         }
     }
     dispose() {
         this.restore();
     }
     // ── Private helpers ─────────────────────────────────────────────────
-    reinject() {
-        if (!this.cssPath || !fs.existsSync(this.cssPath)) {
+    render(layerAOpacity, layerBOpacity) {
+        if (!this._isInjected) {
             return;
         }
-        try {
-            const css = fs.readFileSync(this.cssPath, 'utf-8');
-            const stripped = this.stripMarkerBlock(css);
-            const block = this.buildCssBlock();
-            fs.writeFileSync(this.cssPath, stripped + '\n' + block, 'utf-8');
+        const opacityA = layerAOpacity ?? (this.activeLayer === 'A' ? this.opacity : 0);
+        const opacityB = layerBOpacity ?? (this.activeLayer === 'B' ? this.opacity : 0);
+        this.disposeDecorations();
+        if (this.layerAImage) {
+            this.layerADecoration = this.createLayerDecoration(this.layerAImage, opacityA);
         }
-        catch (err) {
-            console.error('[mood-background] reinject failed:', err);
+        if (this.layerBImage) {
+            this.layerBDecoration = this.createLayerDecoration(this.layerBImage, opacityB);
+        }
+        for (const editor of vscode.window.visibleTextEditors) {
+            this.applyToEditor(editor);
         }
     }
-    stripInjection() {
-        if (!this.cssPath || !fs.existsSync(this.cssPath)) {
+    applyToEditor(editor) {
+        const range = new vscode.Range(0, 0, 0, 0);
+        if (this.layerADecoration) {
+            editor.setDecorations(this.layerADecoration, [range]);
+        }
+        if (this.layerBDecoration) {
+            editor.setDecorations(this.layerBDecoration, [range]);
+        }
+    }
+    animateCrossfade(fromLayer, toLayer) {
+        this.stopAnimation();
+        const durationMs = Math.max(0, this.transitionDuration * 1000);
+        if (durationMs === 0) {
+            this.render();
             return;
         }
-        try {
-            const css = fs.readFileSync(this.cssPath, 'utf-8');
-            const stripped = this.stripMarkerBlock(css);
-            fs.writeFileSync(this.cssPath, stripped, 'utf-8');
-            this._isInjected = false;
-        }
-        catch (err) {
-            console.error('[mood-background] stripInjection failed:', err);
-        }
-    }
-    stripMarkerBlock(css) {
-        const { MARKER_START, MARKER_END } = CssInjector;
-        const startIdx = css.indexOf(MARKER_START);
-        const endIdx = css.indexOf(MARKER_END);
-        if (startIdx !== -1 && endIdx !== -1) {
-            return css.slice(0, startIdx) + css.slice(endIdx + MARKER_END.length);
-        }
-        return css;
-    }
-    resolveCssPath() {
-        const candidates = [];
-        // Strategy 1: vscode.env.appRoot (most reliable)
-        try {
-            const appRoot = vscode.env.appRoot;
-            if (appRoot) {
-                candidates.push(path.join(appRoot, 'out', 'vs', 'workbench', 'workbench.desktop.main.css'), path.join(appRoot, 'vs', 'workbench', 'workbench.desktop.main.css'));
+        const frameMs = Math.max(16, Math.floor(1000 / this.framesPerSecond));
+        const startedAt = Date.now();
+        const tick = () => {
+            const progress = Math.min(1, (Date.now() - startedAt) / durationMs);
+            const eased = this.easeInOut(progress);
+            const fromOpacity = this.opacity * (1 - eased);
+            const toOpacity = this.opacity * eased;
+            const layerAOpacity = fromLayer === 'A' ? fromOpacity : (toLayer === 'A' ? toOpacity : 0);
+            const layerBOpacity = fromLayer === 'B' ? fromOpacity : (toLayer === 'B' ? toOpacity : 0);
+            this.render(layerAOpacity, layerBOpacity);
+            if (progress >= 1) {
+                this.stopAnimation();
+                this.render();
+                return;
             }
-        }
-        catch { /* ignore */ }
-        // Strategy 2: require.resolve walk-up
-        try {
-            const vscodeMain = /*require.resolve*/(1);
-            let base = path.dirname(vscodeMain);
-            for (let i = 0; i < 6; i++) {
-                candidates.push(path.join(base, 'out', 'vs', 'workbench', 'workbench.desktop.main.css'), path.join(base, 'vs', 'workbench', 'workbench.desktop.main.css'));
-                const parent = path.dirname(base);
-                if (parent === base)
-                    break;
-                base = parent;
-            }
-        }
-        catch { /* ignore */ }
-        for (const c of candidates) {
-            if (fs.existsSync(c)) {
-                return c;
-            }
-        }
-        return null;
+            this.animationTimer = setTimeout(tick, frameMs);
+        };
+        this.animationTimer = setTimeout(tick, frameMs);
     }
-    backupIfNeeded() {
-        if (!this.cssPath)
-            return;
-        const backupPath = this.cssPath + '.mood-backup';
-        if (!fs.existsSync(backupPath)) {
-            fs.copyFileSync(this.cssPath, backupPath);
-            console.log('[mood-background] Backup created:', backupPath);
+    createLayerDecoration(imagePath, layerOpacity) {
+        return vscode.window.createTextEditorDecorationType({
+            isWholeLine: true,
+            rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+            before: {
+                contentIconPath: vscode.Uri.file(imagePath),
+                width: '100vw',
+                height: '100vh',
+                margin: '0 0 0 0',
+                textDecoration: [
+                    'none',
+                    'position: fixed',
+                    'inset: 0',
+                    'z-index: 0',
+                    'pointer-events: none',
+                    `opacity: ${this.clampOpacity(layerOpacity)}`,
+                    'background-size: cover !important',
+                    'background-position: center center !important',
+                    'background-repeat: no-repeat !important',
+                    'mix-blend-mode: normal',
+                ].join('; '),
+            },
+        });
+    }
+    disposeDecorations() {
+        this.layerADecoration?.dispose();
+        this.layerBDecoration?.dispose();
+        this.layerADecoration = undefined;
+        this.layerBDecoration = undefined;
+    }
+    stopAnimation() {
+        if (this.animationTimer !== undefined) {
+            clearTimeout(this.animationTimer);
+            this.animationTimer = undefined;
         }
     }
-    toFileUri(filePath) {
-        // Normalize Windows backslashes to forward slashes
-        let normalized = filePath.replace(/\\/g, '/');
-        // Ensure drive letter starts with slash (e.g., /d:/path)
-        if (/^[A-Z]:/i.test(normalized) && !normalized.startsWith('/')) {
-            normalized = '/' + normalized;
-        }
-        // Ensure exactly one "file:///" prefix
-        return 'file://' + normalized;
+    clampOpacity(value) {
+        return Math.min(1, Math.max(0, value));
     }
-    buildCssBlock() {
-        const { MARKER_START, MARKER_END } = CssInjector;
-        const dur = this.transitionDuration + 's';
-        let bgImage;
-        let bgOpacity;
-        if (this.activeLayer === 'A') {
-            bgImage = this.layerAImage;
-            bgOpacity = this.opacity;
-        }
-        else {
-            bgImage = this.layerBImage ?? this.layerAImage;
-            bgOpacity = this.opacity;
-        }
-        const bgUrl = bgImage ? `url('${this.toFileUri(bgImage)}')` : 'none';
-        // 使用与 vscode-background 完全相同的选择器和策略
-        // 核心路径: .editor-instance > .monaco-editor > .overflow-guard > .monaco-scrollable-element::before
-        return `
-${MARKER_START}
-/* 移除编辑器默认背景色 */
-[id='workbench.parts.editor'] .editor-container .overflow-guard > .monaco-scrollable-element > .monaco-editor-background {
-  background: none !important;
-}
-
-/* 在 .monaco-scrollable-element 上用 ::before 伪元素显示背景图 */
-[id='workbench.parts.editor'] .editor-instance > .monaco-editor > .overflow-guard > .monaco-scrollable-element::before {
-  content: '';
-  width: 100%;
-  height: 100%;
-  position: absolute;
-  z-index: initial;
-  pointer-events: none;
-  transition: opacity ${dur} ease-in-out;
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: cover;
-  opacity: ${bgOpacity};
-  background-image: ${bgUrl};
-  mix-blend-mode: normal;
-}
-
-/* minimap 稍微透明 */
-.minimap {
-  opacity: 0.8;
-}
-${MARKER_END}
-`;
+    easeInOut(progress) {
+        return progress < 0.5
+            ? 2 * progress * progress
+            : 1 - Math.pow(-2 * progress + 2, 2) / 2;
     }
 }
 exports.CssInjector = CssInjector;
@@ -743,15 +699,16 @@ class EmotionAnalyzer {
         if (document.lineCount === 0) {
             return DEFAULT_EMOTION;
         }
-        const startLine = Math.max(0, document.lineCount - this.linesToAnalyze);
-        const recentCode = document.getText(new vscode.Range(startLine, 0, document.lineCount - 1, document.lineAt(document.lineCount - 1).text.length));
+        const cursorLine = editor.selection.active.line;
+        const endLine = Math.min(document.lineCount - 1, cursorLine);
+        const startLine = Math.max(0, endLine - this.linesToAnalyze + 1);
+        const recentCode = document.getText(new vscode.Range(startLine, 0, endLine, document.lineAt(endLine).text.length));
         if (!recentCode.trim()) {
             return DEFAULT_EMOTION;
         }
         try {
             const [model] = await vscode.lm.selectChatModels({
                 vendor: 'copilot',
-                family: 'gpt-4o',
             });
             if (!model) {
                 return this.fallbackAnalyze(document);
@@ -804,10 +761,10 @@ class EmotionAnalyzer {
         const diagnostics = vscode.languages.getDiagnostics(document.uri);
         const errorCount = diagnostics.filter((d) => d.severity === vscode.DiagnosticSeverity.Error).length;
         if (errorCount > 5) {
-            return 'angry';
+            return 'sad';
         }
         if (errorCount > 2) {
-            return 'sad';
+            return 'angry';
         }
         if (errorCount > 0) {
             return 'angry and cool';

@@ -5,6 +5,7 @@ import { EmotionAnalyzer } from './emotionAnalyzer';
 import { BackgroundRenderer } from './backgroundRenderer';
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
+let editRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 let cssInjectorInstance: CssInjector | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -12,7 +13,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const config = vscode.workspace.getConfiguration('moodBackground');
         let enabled = config.get<boolean>('enabled', true);
 
-        // Create core instances
         const imageManager = new ImageManager(context, config.get<string>('imagesFolder', ''));
         await imageManager.scanImages();
 
@@ -24,21 +24,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         let analyzer = new EmotionAnalyzer(config.get<number>('linesToAnalyze', 20));
         const renderer = new BackgroundRenderer(cssInjector);
         renderer.setTransitionDuration(config.get<number>('transitionDuration', 1.5) * 1000);
+        context.subscriptions.push(cssInjector, renderer, analyzer);
 
-        // Inject CSS on startup if enabled
         if (enabled) {
-            console.log('[MoodBackground] Applying background...');
             cssInjector.inject();
-            console.log('[MoodBackground] Background applied. isInjected:', cssInjector.isInjected());
-            // CSS 修改后需要重新加载窗口才能生效
-            vscode.window.showInformationMessage(
-                'Mood Background 已安装！需要重新加载窗口才能看到背景图片。',
-                '重新加载'
-            ).then(choice => {
-                if (choice === '重新加载') {
-                    vscode.commands.executeCommand('workbench.action.reloadWindow');
-                }
-            });
         }
 
         // ── Status bar ──────────────────────────────────────────
@@ -54,33 +43,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // ── Refresh logic ───────────────────────────────────────
         async function refreshEmotion(): Promise<void> {
             if (!enabled) {
-                console.log('[MoodBackground] refreshEmotion: disabled, skipping');
                 return;
             }
             try {
-                console.log('[MoodBackground] Analyzing emotion...');
                 const emotion = await analyzer.analyze();
-                console.log('[MoodBackground] Emotion result:', emotion);
                 const imagePath = imageManager.getImageForEmotion(emotion);
-                console.log('[MoodBackground] Image path for', emotion, ':', imagePath);
-                console.log('[MoodBackground] Available emotions:', imageManager.getAvailableEmotions());
                 if (imagePath) {
                     renderer.switchTo(imagePath, emotion);
-                    console.log('[MoodBackground] Renderer.switchTo called');
-                    // CSS 文件修改后需要重新加载窗口才能生效
-                    vscode.window.showInformationMessage(
-                        `情绪已切换为: ${emotion}`,
-                        '重新加载以查看'
-                    ).then(choice => {
-                        if (choice === '重新加载以查看') {
-                            vscode.commands.executeCommand('workbench.action.reloadWindow');
-                        }
-                    });
+                } else {
+                    const fallbackImage = imageManager.getImageForEmotion('happy');
+                    if (fallbackImage) {
+                        renderer.switchTo(fallbackImage, 'happy');
+                    }
                 }
                 statusBar.text = `$(paintcan) Mood: ${emotion}`;
             } catch (err) {
                 console.error('[MoodBackground] refreshEmotion error:', err);
             }
+        }
+
+        function scheduleEditRefresh(): void {
+            if (!enabled) {
+                return;
+            }
+            if (editRefreshTimer !== undefined) {
+                clearTimeout(editRefreshTimer);
+            }
+            editRefreshTimer = setTimeout(() => {
+                editRefreshTimer = undefined;
+                refreshEmotion();
+            }, 3000);
         }
 
         // ── Timer helpers ───────────────────────────────────────
@@ -116,6 +108,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 cssInjector.restore();
                 statusBar.hide();
                 stopTimer();
+                if (editRefreshTimer !== undefined) {
+                    clearTimeout(editRefreshTimer);
+                    editRefreshTimer = undefined;
+                }
             })
         );
 
@@ -143,6 +139,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             })
         );
 
+        context.subscriptions.push(
+            vscode.workspace.onDidChangeTextDocument((event) => {
+                if (event.document === vscode.window.activeTextEditor?.document) {
+                    scheduleEditRefresh();
+                }
+            })
+        );
+
+        context.subscriptions.push(
+            vscode.window.onDidChangeActiveTextEditor(() => {
+                cssInjector.applyToVisibleEditors();
+                scheduleEditRefresh();
+            })
+        );
+
+        context.subscriptions.push(
+            vscode.window.onDidChangeVisibleTextEditors(() => {
+                cssInjector.applyToVisibleEditors();
+            })
+        );
+
         // React to configuration changes
         context.subscriptions.push(
             vscode.workspace.onDidChangeConfiguration(async (e) => {
@@ -156,7 +173,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
 
                 if (e.affectsConfiguration('moodBackground.transitionDuration')) {
-                    renderer.setTransitionDuration(cfg.get<number>('transitionDuration', 1.5) * 1000);
+                    const duration = cfg.get<number>('transitionDuration', 1.5);
+                    renderer.setTransitionDuration(duration * 1000);
+                    cssInjector.updateTransitionDuration(duration);
                 }
 
                 if (e.affectsConfiguration('moodBackground.updateInterval')) {
@@ -175,7 +194,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
 
                 if (e.affectsConfiguration('moodBackground.linesToAnalyze')) {
+                    analyzer.dispose();
                     analyzer = new EmotionAnalyzer(cfg.get<number>('linesToAnalyze', 20));
+                    await refreshEmotion();
+                }
+
+                if (e.affectsConfiguration('moodBackground.imagesFolder')) {
+                    await imageManager.setImagesFolder(cfg.get<string>('imagesFolder', ''));
                     await refreshEmotion();
                 }
             })

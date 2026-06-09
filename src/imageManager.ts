@@ -7,13 +7,13 @@ import * as fs from 'fs';
  * Scans an `images/` directory and provides fuzzy-matching lookup.
  */
 export class ImageManager {
-    private readonly imagesFolder: string;
+    private imagesFolder: string;
     private emotionMap: Map<string, string> = new Map();
+    private readonly defaultImagesFolder: string;
 
     constructor(context: vscode.ExtensionContext, customImagesFolder?: string) {
-        this.imagesFolder = (customImagesFolder && customImagesFolder.trim()) 
-            ? customImagesFolder 
-            : context.asAbsolutePath('images');
+        this.defaultImagesFolder = context.asAbsolutePath('images');
+        this.imagesFolder = this.resolveImagesFolder(customImagesFolder);
     }
 
     /**
@@ -98,6 +98,11 @@ export class ImageManager {
         return Array.from(this.emotionMap.keys());
     }
 
+    async setImagesFolder(customImagesFolder?: string): Promise<void> {
+        this.imagesFolder = this.resolveImagesFolder(customImagesFolder);
+        await this.scanImages();
+    }
+
     /**
      * Check whether an emotion image exists (uses the same fuzzy logic).
      */
@@ -115,6 +120,12 @@ export class ImageManager {
             .toLowerCase()
             .replace(/[_-]+/g, ' ')
             .trim();
+    }
+
+    private resolveImagesFolder(customImagesFolder?: string): string {
+        return (customImagesFolder && customImagesFolder.trim())
+            ? customImagesFolder.trim()
+            : this.defaultImagesFolder;
     }
 
     /**
