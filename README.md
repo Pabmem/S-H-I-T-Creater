@@ -5,7 +5,12 @@
 ## ✨ 功能特性
 
 - 🖼️ **自适应背景图片**：自动读取 `images/` 目录中的图片，自适应分辨率显示在编辑器背景
-- 🤖 **LLM 情绪分析**：使用 VS Code Copilot 内置 LLM 分析最近编写的代码质量
+- 🤖 **TypeSafe jev 质量评估**（主要方式）：调用 [TypeSafe](https://docs.typesafe.ai/) 的 `jev-latest` 模型对代码做结构化评估：
+  - `choice` 问题 —— 从 7 个情绪标签中选一个，返回完整概率分布和置信度
+  - `score` 问题 —— 按评分细则给出概率加权的质量分（可落在两级之间）
+  - 对 `429 Too Many Requests` / `529 Overloaded` 自动指数退避重试
+- 🧠 **Copilot LLM 兜底**：TypeSafe 不可用时降级为 GitHub Copilot 内置 LLM 分析
+- 📊 **状态栏详情**：鼠标悬停状态栏可查看质量分、质量等级和各情绪的概率分布
 - 🎨 **7 种情绪标签**：
   | 情绪 | 含义 | 触发场景 |
   |------|------|----------|
@@ -40,6 +45,9 @@ npm run compile
 | `moodBackground.opacity` | `0.15` | 背景透明度 (0.0~1.0) |
 | `moodBackground.updateInterval` | `30` | 分析间隔（秒） |
 | `moodBackground.linesToAnalyze` | `20` | 分析最近 N 行代码 |
+| `moodBackground.apiKey` | `""` | TypeSafe (jev) API Key，留空则读环境变量 `TYPESAFE_API_KEY` |
+| `moodBackground.model` | `jev-latest` | TypeSafe 评估使用的模型 |
+| `moodBackground.apiEndpoint` | `""` | TypeSafe API 地址，留空使用官方默认 |
 | `moodBackground.transitionDuration` | `1.5` | 渐变时长（秒） |
 | `moodBackground.imagesFolder` | `""` | 自定义图片目录 |
 
@@ -69,8 +77,9 @@ images/
 
 ## ⚠️ 注意
 
-- 需要安装 [GitHub Copilot](https://marketplace.visualstudio.com/items?itemName=GitHub.copilot) 扩展以使用 LLM 分析功能
-- 如果 Copilot 不可用，会自动降级为基于代码诊断的规则分析
+- 配置 TypeSafe (jev) API Key 后，代码质量判断由 `jev-latest` 模型完成，结果驱动背景图片切换
+- API Key 可在 `moodBackground.apiKey` 设置中填写，或通过环境变量 `TYPESAFE_API_KEY` 提供
+- 如果 TypeSafe 和 Copilot 都不可用，会自动降级为基于代码诊断的规则分析
 - 插件只在可见文本编辑器中渲染背景，禁用后会立即清理装饰层
 
 ## 📁 项目结构
@@ -79,7 +88,8 @@ images/
 ├── src/
 │   ├── extension.ts          # 插件入口
 │   ├── cssInjector.ts        # 安全背景装饰层
-│   ├── emotionAnalyzer.ts    # LLM 情绪分析
+│   ├── emotionAnalyzer.ts    # 情绪分析（jev → Copilot → 诊断 兜底链）
+│   ├── typeSafeClient.ts     # TypeSafe (jev) API 客户端
 │   ├── imageManager.ts       # 图片管理
 │   └── backgroundRenderer.ts # 渐变渲染
 ├── images/                   # 情绪图片资源

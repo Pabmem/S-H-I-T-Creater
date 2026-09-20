@@ -8,6 +8,17 @@ let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let editRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 let cssInjectorInstance: CssInjector | undefined;
 
+/** 根据当前配置创建情绪分析器（jev API Key 支持设置项或 TYPESAFE_API_KEY 环境变量） */
+function createAnalyzer(config: vscode.WorkspaceConfiguration): EmotionAnalyzer {
+    const envKey = process.env.TYPESAFE_API_KEY;
+    return new EmotionAnalyzer({
+        linesToAnalyze: config.get<number>('linesToAnalyze', 20),
+        apiKey: config.get<string>('apiKey', '') || envKey,
+        model: config.get<string>('model', 'jev-latest'),
+        endpoint: config.get<string>('apiEndpoint', ''),
+    });
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     try {
         const config = vscode.workspace.getConfiguration('moodBackground');
@@ -21,7 +32,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             config.get<number>('transitionDuration', 1.5)
         );
         cssInjectorInstance = cssInjector;
-        let analyzer = new EmotionAnalyzer(config.get<number>('linesToAnalyze', 20));
+        let analyzer = createAnalyzer(config);
         const renderer = new BackgroundRenderer(cssInjector);
         renderer.setTransitionDuration(config.get<number>('transitionDuration', 1.5) * 1000);
         context.subscriptions.push(cssInjector, renderer, analyzer);
@@ -46,17 +57,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 return;
             }
             try {
-                const emotion = await analyzer.analyze();
-                const imagePath = imageManager.getImageForEmotion(emotion);
+                const result = await analyzer.analyze();
+                const imagePath = imageManager.getImageForEmotion(result.emotion);
                 if (imagePath) {
-                    renderer.switchTo(imagePath, emotion);
+                    renderer.switchTo(imagePath, result.emotion);
                 } else {
                     const fallbackImage = imageManager.getImageForEmotion('happy');
                     if (fallbackImage) {
                         renderer.switchTo(fallbackImage, 'happy');
                     }
                 }
-                statusBar.text = `$(paintcan) Mood: ${emotion}`;
+
+                // ── 状态栏：情绪 + jev 质量分/置信度 ──────────────
+                let detail = '';
+                if (result.source === 'jev') {
+                    const scoreStr =
+                        result.qualityScore !== undefined
+                            ? ` Q${Number(result.qualityScore).toFixed(1)}`
+                            : '';
+                    const confStr =
+                        result.confidence !== undefined
+                            ? ` (${Math.round(result.confidence * 100)}%)`
+                            : '';
+                    detail = `${scoreStr}${confStr}`;
+                } else if (result.source === 'copilot') {
+                    detail = ' (copilot)';
+                }
+                statusBar.text = `$(paintcan) Mood: ${result.emotion}${detail}`;
+
+                // 悬浮提示：jev 概率分布明细
+                const md = new vscode.MarkdownString();
+                md.isTrusted = true;
+                md.appendMarkdown(`**当前情绪**: ${result.emotion}\n\n`);
+                md.appendMarkdown(`**分析来源**: ${result.source}\n`);
+                if (result.qualityScore !== undefined && result.qualityLegend && result.qualityLegend.length > 0) {
+                    const level = Math.min(
+                        result.qualityLegend.length - 1,
+                        Math.max(0, Math.round(result.qualityScore))
+                    );
+                    md.appendMarkdown(`\n\n**质量分**: ${result.qualityScore.toFixed(2)} / ${result.qualityLegend.length - 1}`);
+                    md.appendMarkdown(`\n\n**质量等级**: ${result.qualityLegend[level]}`);
+                }
+                if (result.probabilities && Object.keys(result.probabilities).length > 0) {
+                    md.appendMarkdown('\n\n**情绪概率分布**\n\n');
+                    for (const [label, prob] of Object.entries(result.probabilities)
+                        .sort((a, b) => b[1] - a[1])) {
+                        md.appendMarkdown(`- ${label}: ${(prob * 100).toFixed(1)}%\n`);
+                    }
+                }
+                statusBar.tooltip = md;
             } catch (err) {
                 console.error('[MoodBackground] refreshEmotion error:', err);
             }
@@ -193,9 +242,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     }
                 }
 
-                if (e.affectsConfiguration('moodBackground.linesToAnalyze')) {
+                if (e.affectsConfiguration('moodBackground.linesToAnalyze') ||
+                    e.affectsConfiguration('moodBackground.apiKey') ||
+                    e.affectsConfiguration('moodBackground.model') ||
+                    e.affectsConfiguration('moodBackground.apiEndpoint')) {
                     analyzer.dispose();
-                    analyzer = new EmotionAnalyzer(cfg.get<number>('linesToAnalyze', 20));
+                    analyzer = createAnalyzer(cfg);
                     await refreshEmotion();
                 }
 

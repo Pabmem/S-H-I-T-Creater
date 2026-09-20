@@ -45,10 +45,20 @@ const vscode = __importStar(__webpack_require__(1));
 const imageManager_1 = __webpack_require__(2);
 const cssInjector_1 = __webpack_require__(5);
 const emotionAnalyzer_1 = __webpack_require__(6);
-const backgroundRenderer_1 = __webpack_require__(7);
+const backgroundRenderer_1 = __webpack_require__(10);
 let refreshTimer;
 let editRefreshTimer;
 let cssInjectorInstance;
+/** 根据当前配置创建情绪分析器（jev API Key 支持设置项或 TYPESAFE_API_KEY 环境变量） */
+function createAnalyzer(config) {
+    const envKey = process.env.TYPESAFE_API_KEY;
+    return new emotionAnalyzer_1.EmotionAnalyzer({
+        linesToAnalyze: config.get('linesToAnalyze', 20),
+        apiKey: config.get('apiKey', '') || envKey,
+        model: config.get('model', 'jev-latest'),
+        endpoint: config.get('apiEndpoint', ''),
+    });
+}
 async function activate(context) {
     try {
         const config = vscode.workspace.getConfiguration('moodBackground');
@@ -57,7 +67,7 @@ async function activate(context) {
         await imageManager.scanImages();
         const cssInjector = new cssInjector_1.CssInjector(config.get('opacity', 0.15), config.get('transitionDuration', 1.5));
         cssInjectorInstance = cssInjector;
-        let analyzer = new emotionAnalyzer_1.EmotionAnalyzer(config.get('linesToAnalyze', 20));
+        let analyzer = createAnalyzer(config);
         const renderer = new backgroundRenderer_1.BackgroundRenderer(cssInjector);
         renderer.setTransitionDuration(config.get('transitionDuration', 1.5) * 1000);
         context.subscriptions.push(cssInjector, renderer, analyzer);
@@ -79,10 +89,10 @@ async function activate(context) {
                 return;
             }
             try {
-                const emotion = await analyzer.analyze();
-                const imagePath = imageManager.getImageForEmotion(emotion);
+                const result = await analyzer.analyze();
+                const imagePath = imageManager.getImageForEmotion(result.emotion);
                 if (imagePath) {
-                    renderer.switchTo(imagePath, emotion);
+                    renderer.switchTo(imagePath, result.emotion);
                 }
                 else {
                     const fallbackImage = imageManager.getImageForEmotion('happy');
@@ -90,7 +100,39 @@ async function activate(context) {
                         renderer.switchTo(fallbackImage, 'happy');
                     }
                 }
-                statusBar.text = `$(paintcan) Mood: ${emotion}`;
+                // ── 状态栏：情绪 + jev 质量分/置信度 ──────────────
+                let detail = '';
+                if (result.source === 'jev') {
+                    const scoreStr = result.qualityScore !== undefined
+                        ? ` Q${Number(result.qualityScore).toFixed(1)}`
+                        : '';
+                    const confStr = result.confidence !== undefined
+                        ? ` (${Math.round(result.confidence * 100)}%)`
+                        : '';
+                    detail = `${scoreStr}${confStr}`;
+                }
+                else if (result.source === 'copilot') {
+                    detail = ' (copilot)';
+                }
+                statusBar.text = `$(paintcan) Mood: ${result.emotion}${detail}`;
+                // 悬浮提示：jev 概率分布明细
+                const md = new vscode.MarkdownString();
+                md.isTrusted = true;
+                md.appendMarkdown(`**当前情绪**: ${result.emotion}\n\n`);
+                md.appendMarkdown(`**分析来源**: ${result.source}\n`);
+                if (result.qualityScore !== undefined && result.qualityLegend && result.qualityLegend.length > 0) {
+                    const level = Math.min(result.qualityLegend.length - 1, Math.max(0, Math.round(result.qualityScore)));
+                    md.appendMarkdown(`\n\n**质量分**: ${result.qualityScore.toFixed(2)} / ${result.qualityLegend.length - 1}`);
+                    md.appendMarkdown(`\n\n**质量等级**: ${result.qualityLegend[level]}`);
+                }
+                if (result.probabilities && Object.keys(result.probabilities).length > 0) {
+                    md.appendMarkdown('\n\n**情绪概率分布**\n\n');
+                    for (const [label, prob] of Object.entries(result.probabilities)
+                        .sort((a, b) => b[1] - a[1])) {
+                        md.appendMarkdown(`- ${label}: ${(prob * 100).toFixed(1)}%\n`);
+                    }
+                }
+                statusBar.tooltip = md;
             }
             catch (err) {
                 console.error('[MoodBackground] refreshEmotion error:', err);
@@ -196,9 +238,12 @@ async function activate(context) {
                     await vscode.commands.executeCommand('moodBackground.disable');
                 }
             }
-            if (e.affectsConfiguration('moodBackground.linesToAnalyze')) {
+            if (e.affectsConfiguration('moodBackground.linesToAnalyze') ||
+                e.affectsConfiguration('moodBackground.apiKey') ||
+                e.affectsConfiguration('moodBackground.model') ||
+                e.affectsConfiguration('moodBackground.apiEndpoint')) {
                 analyzer.dispose();
-                analyzer = new emotionAnalyzer_1.EmotionAnalyzer(cfg.get('linesToAnalyze', 20));
+                analyzer = createAnalyzer(cfg);
                 await refreshEmotion();
             }
             if (e.affectsConfiguration('moodBackground.imagesFolder')) {
@@ -675,82 +720,111 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.EmotionAnalyzer = void 0;
 const vscode = __importStar(__webpack_require__(1));
-const VALID_EMOTIONS = [
-    'very happy',
-    'angry and cool',
-    'happy',
-    'cool',
-    'angry',
-    'sad',
-    'wdf',
-];
+const typeSafeClient_1 = __webpack_require__(7);
 const DEFAULT_EMOTION = 'happy';
 class EmotionAnalyzer {
     linesToAnalyze;
-    constructor(linesToAnalyze = 20) {
-        this.linesToAnalyze = linesToAnalyze;
+    typeSafeClient;
+    constructor(options) {
+        this.linesToAnalyze = options.linesToAnalyze;
+        if (options.apiKey && options.apiKey.trim()) {
+            this.typeSafeClient = new typeSafeClient_1.TypeSafeClient({
+                apiKey: options.apiKey.trim(),
+                model: options.model,
+                endpoint: options.endpoint,
+            });
+        }
     }
     async analyze() {
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
-            return DEFAULT_EMOTION;
+            return { emotion: DEFAULT_EMOTION, source: 'fallback' };
         }
         const document = editor.document;
         if (document.lineCount === 0) {
-            return DEFAULT_EMOTION;
+            return { emotion: DEFAULT_EMOTION, source: 'fallback' };
         }
-        const cursorLine = editor.selection.active.line;
-        const endLine = Math.min(document.lineCount - 1, cursorLine);
-        const startLine = Math.max(0, endLine - this.linesToAnalyze + 1);
-        const recentCode = document.getText(new vscode.Range(startLine, 0, endLine, document.lineAt(endLine).text.length));
+        const recentCode = this.getRecentCode(editor, document);
         if (!recentCode.trim()) {
-            return DEFAULT_EMOTION;
+            return { emotion: DEFAULT_EMOTION, source: 'fallback' };
         }
+        // 1) 优先：TypeSafe jev 结构化评估
+        if (this.typeSafeClient) {
+            try {
+                const jev = await this.typeSafeClient.evaluate(recentCode);
+                return {
+                    emotion: jev.emotion,
+                    qualityScore: jev.qualityScore,
+                    confidence: jev.confidence,
+                    probabilities: jev.probabilities,
+                    qualityLegend: jev.qualityLegend,
+                    source: 'jev',
+                };
+            }
+            catch (error) {
+                console.warn('[EmotionAnalyzer] TypeSafe jev evaluation failed, falling back:', error);
+            }
+        }
+        // 2) 备选：Copilot LLM
         try {
             const [model] = await vscode.lm.selectChatModels({
                 vendor: 'copilot',
             });
-            if (!model) {
-                return this.fallbackAnalyze(document);
+            if (model) {
+                const result = await this.analyzeWithCopilot(model, recentCode);
+                if (result) {
+                    return result;
+                }
             }
-            const messages = [
-                vscode.LanguageModelChatMessage.User(`你是一个代码质量情绪分析师。根据以下代码片段，选择一个最匹配的情绪标签。\n\n` +
-                    `可选标签（必须从以下列表中选择一个）:\n` +
-                    `- happy: 代码质量不错，结构清晰\n` +
-                    `- cool: 代码写得出乎意料的好，有创意\n` +
-                    `- angry: 代码质量很差，有明显问题\n` +
-                    `- sad: 代码非常糟糕，让人沮丧\n` +
-                    `- very happy: 代码非常优秀，令人赞叹\n` +
-                    `- angry and cool: 代码有问题但也有亮点\n` +
-                    `- wdf: 代码让人困惑，看不懂在写什么\n\n` +
-                    `只输出一个标签，不要任何解释或额外文字。`),
-                vscode.LanguageModelChatMessage.User(recentCode),
-            ];
-            const response = await model.sendRequest(messages, {});
-            let result = '';
-            for await (const fragment of response.text) {
-                result += fragment;
-            }
-            return this.parseEmotion(result);
         }
         catch (error) {
             if (error instanceof vscode.LanguageModelError) {
-                if (error.code === 'NotFound') {
-                    console.warn('[EmotionAnalyzer] Language model not found, using fallback analysis.');
-                    return this.fallbackAnalyze(document);
+                if (error.code === 'NotFound' || error.code === 'NoPermissions') {
+                    console.warn('[EmotionAnalyzer] Copilot language model unavailable, using fallback analysis.');
                 }
-                if (error.code === 'NoPermissions') {
-                    console.warn('[EmotionAnalyzer] No permissions to access language model, using fallback analysis.');
-                    return this.fallbackAnalyze(document);
+                else {
+                    console.error('[EmotionAnalyzer] Copilot analysis error:', error);
                 }
             }
-            console.error('[EmotionAnalyzer] Unexpected error during emotion analysis:', error);
-            return DEFAULT_EMOTION;
+            else {
+                console.error('[EmotionAnalyzer] Unexpected error during emotion analysis:', error);
+            }
         }
+        // 3) 兜底：基于诊断的规则分析
+        return this.fallbackAnalyze(document);
+    }
+    // ── internal helpers ──────────────────────────────────────────────
+    getRecentCode(editor, document) {
+        const cursorLine = editor.selection.active.line;
+        const endLine = Math.min(document.lineCount - 1, cursorLine);
+        const startLine = Math.max(0, endLine - this.linesToAnalyze + 1);
+        return document.getText(new vscode.Range(startLine, 0, endLine, document.lineAt(endLine).text.length));
+    }
+    async analyzeWithCopilot(model, recentCode) {
+        const messages = [
+            vscode.LanguageModelChatMessage.User(`你是一个代码质量情绪分析师。根据以下代码片段，选择一个最匹配的情绪标签。\n\n` +
+                `可选标签（必须从以下列表中选择一个）:\n` +
+                `- happy: 代码质量不错，结构清晰\n` +
+                `- cool: 代码写得出乎意料的好，有创意\n` +
+                `- angry: 代码质量很差，有明显问题\n` +
+                `- sad: 代码非常糟糕，让人沮丧\n` +
+                `- very happy: 代码非常优秀，令人赞叹\n` +
+                `- angry and cool: 代码有问题但也有亮点\n` +
+                `- wdf: 代码让人困惑，看不懂在写什么\n\n` +
+                `只输出一个标签，不要任何解释或额外文字。`),
+            vscode.LanguageModelChatMessage.User(recentCode),
+        ];
+        const response = await model.sendRequest(messages, {});
+        let result = '';
+        for await (const fragment of response.text) {
+            result += fragment;
+        }
+        const emotion = this.parseEmotion(result);
+        return { emotion, source: 'copilot' };
     }
     parseEmotion(text) {
         const normalized = text.trim().toLowerCase();
-        for (const label of VALID_EMOTIONS) {
+        for (const label of typeSafeClient_1.EMOTION_LABELS) {
             if (normalized.includes(label)) {
                 return label;
             }
@@ -760,16 +834,20 @@ class EmotionAnalyzer {
     fallbackAnalyze(document) {
         const diagnostics = vscode.languages.getDiagnostics(document.uri);
         const errorCount = diagnostics.filter((d) => d.severity === vscode.DiagnosticSeverity.Error).length;
+        let emotion;
         if (errorCount > 5) {
-            return 'sad';
+            emotion = 'sad';
         }
-        if (errorCount > 2) {
-            return 'angry';
+        else if (errorCount > 2) {
+            emotion = 'angry';
         }
-        if (errorCount > 0) {
-            return 'angry and cool';
+        else if (errorCount > 0) {
+            emotion = 'angry and cool';
         }
-        return DEFAULT_EMOTION;
+        else {
+            emotion = DEFAULT_EMOTION;
+        }
+        return { emotion, source: 'fallback' };
     }
     dispose() {
         // No resources to dispose
@@ -780,6 +858,256 @@ exports.EmotionAnalyzer = EmotionAnalyzer;
 
 /***/ }),
 /* 7 */
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
+
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TypeSafeClient = exports.QUALITY_LEVELS = exports.EMOTION_LABELS = void 0;
+const https = __importStar(__webpack_require__(8));
+const http = __importStar(__webpack_require__(9));
+/**
+ * TypeSafe (jev) API 客户端。
+ *
+ * 调用 POST {endpoint}/v1/systemone，用 jev 模型对代码做结构化评估：
+ *   - emotion: choice 问题 —— 从 7 个情绪标签中选一个（附带完整概率分布和 confidence）
+ *   - quality: score 问题  —— 按评分细则给出概率加权分数（可落在两级之间）
+ *
+ * 文档: https://docs.typesafe.ai/ （API reference）
+ */
+exports.EMOTION_LABELS = [
+    'happy',
+    'cool',
+    'angry',
+    'sad',
+    'very happy',
+    'angry and cool',
+    'wdf',
+];
+exports.QUALITY_LEVELS = [
+    '非常糟糕，完全不能工作',
+    '较差，有明显问题',
+    '一般，能工作但不够好',
+    '不错，结构清晰',
+    '非常优秀，令人赞叹',
+];
+class TypeSafeClient {
+    endpoint;
+    apiKey;
+    model;
+    timeoutMs;
+    maxRetries;
+    constructor(options) {
+        this.apiKey = options.apiKey;
+        this.model = options.model || 'jev-latest';
+        // endpoint 允许覆盖（去掉末尾斜杠），默认官方地址
+        this.endpoint = (options.endpoint || 'https://api.typesafe.ai').replace(/\/+$/, '');
+        this.timeoutMs = options.timeoutMs ?? 30000;
+        this.maxRetries = options.maxRetries ?? 3;
+    }
+    /**
+     * 用 jev 评估一段代码，返回结构化结果。
+     * 遇到 429/529 会按指数退避自动重试。
+     */
+    async evaluate(code) {
+        const body = JSON.stringify({
+            state: code,
+            model: this.model,
+            questions: {
+                emotion: {
+                    type: 'choice',
+                    instructions: '根据这段代码的质量，选择一个最匹配的情绪标签。\n' +
+                        '- happy: 代码质量不错，结构清晰\n' +
+                        '- cool: 代码写得出乎意料的好，有创意\n' +
+                        '- angry: 代码质量很差，有明显问题\n' +
+                        '- sad: 代码非常糟糕，让人沮丧\n' +
+                        '- very happy: 代码非常优秀，令人赞叹\n' +
+                        '- angry and cool: 代码有问题但也有亮点\n' +
+                        '- wdf: 代码让人困惑，看不懂在写什么',
+                    criteria: {
+                        'happy': '代码质量不错，结构清晰',
+                        'cool': '代码写得出乎意料的好，有创意',
+                        'angry': '代码质量很差，有明显问题',
+                        'sad': '代码非常糟糕，让人沮丧',
+                        'very happy': '代码非常优秀，令人赞叹',
+                        'angry and cool': '代码有问题但也有亮点',
+                        'wdf': '代码让人困惑，看不懂在写什么',
+                    },
+                },
+                quality: {
+                    type: 'score',
+                    instructions: '评估这段代码的整体质量。',
+                    criteria: [...exports.QUALITY_LEVELS],
+                },
+            },
+        });
+        const response = await this.requestWithRetry(body);
+        return this.parseResponse(response);
+    }
+    // ── HTTP ─────────────────────────────────────────────────────────
+    async requestWithRetry(body) {
+        let lastError;
+        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+            try {
+                return await this.requestOnce(body);
+            }
+            catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                const retryable = err.retryable === true;
+                if (!retryable || attempt === this.maxRetries) {
+                    throw lastError;
+                }
+                // 指数退避: 1s, 2s, 4s ...
+                await sleep(1000 * Math.pow(2, attempt));
+            }
+        }
+        throw lastError ?? new Error('TypeSafe request failed');
+    }
+    requestOnce(body) {
+        return new Promise((resolve, reject) => {
+            const url = new URL(`${this.endpoint}/v1/systemone`);
+            const isHttps = url.protocol === 'https:';
+            const transport = isHttps ? https : http;
+            const req = transport.request({
+                hostname: url.hostname,
+                port: url.port || (isHttps ? 443 : 80),
+                path: url.pathname + url.search,
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body),
+                },
+                timeout: this.timeoutMs,
+            }, (res) => {
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => {
+                    const text = Buffer.concat(chunks).toString('utf8');
+                    const status = res.statusCode ?? 0;
+                    if (status === 429 || status === 529) {
+                        const e = new Error(`TypeSafe rate limited (HTTP ${status})`);
+                        e.retryable = true;
+                        reject(e);
+                        return;
+                    }
+                    if (status === 401) {
+                        reject(new Error('TypeSafe 认证失败 (401)：请检查 API Key（moodBackground.apiKey）'));
+                        return;
+                    }
+                    if (status === 422) {
+                        reject(new Error(`TypeSafe 请求校验失败 (422)：${text}`));
+                        return;
+                    }
+                    if (status < 200 || status >= 300) {
+                        const e = new Error(`TypeSafe 请求失败 (HTTP ${status})：${text}`);
+                        // 5xx 一律可重试
+                        e.retryable = status >= 500;
+                        reject(e);
+                        return;
+                    }
+                    try {
+                        resolve(JSON.parse(text));
+                    }
+                    catch {
+                        reject(new Error(`TypeSafe 返回了无法解析的响应：${text.slice(0, 200)}`));
+                    }
+                });
+            });
+            req.on('timeout', () => {
+                req.destroy(new Error('TypeSafe 请求超时'));
+            });
+            req.on('error', (err) => {
+                const e = new Error(`TypeSafe 网络错误：${err.message}`);
+                e.retryable = true;
+                reject(e);
+            });
+            req.write(body);
+            req.end();
+        });
+    }
+    // ── 解析 ─────────────────────────────────────────────────────────
+    parseResponse(response) {
+        const answers = response.answers ?? {};
+        const emotionAnswer = answers['emotion'];
+        const qualityAnswer = answers['quality'];
+        if (!emotionAnswer || emotionAnswer.type !== 'choice' || !emotionAnswer.choice) {
+            throw new Error('TypeSafe 响应缺少有效的 emotion (choice) 答案');
+        }
+        const emotion = emotionAnswer.choice;
+        const probabilities = emotionAnswer.probabilities ?? {};
+        let qualityScore = 0;
+        let qualityLegend = [...exports.QUALITY_LEVELS];
+        if (qualityAnswer && qualityAnswer.type === 'score' && typeof qualityAnswer.score === 'number') {
+            qualityScore = qualityAnswer.score;
+            if (qualityAnswer.legend) {
+                qualityLegend = Object.keys(qualityAnswer.legend)
+                    .sort((a, b) => Number(a) - Number(b))
+                    .map((k) => qualityAnswer.legend[k]);
+            }
+        }
+        const confidence = emotionAnswer.confidence ?? qualityAnswer?.confidence ?? 0;
+        return {
+            emotion,
+            qualityScore,
+            confidence,
+            probabilities,
+            qualityLegend,
+        };
+    }
+}
+exports.TypeSafeClient = TypeSafeClient;
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+
+/***/ }),
+/* 8 */
+/***/ ((module) => {
+
+module.exports = require("https");
+
+/***/ }),
+/* 9 */
+/***/ ((module) => {
+
+module.exports = require("http");
+
+/***/ }),
+/* 10 */
 /***/ ((__unused_webpack_module, exports) => {
 
 

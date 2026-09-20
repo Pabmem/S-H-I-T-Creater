@@ -61,6 +61,21 @@
           "maximum": 100,
           "description": "分析最近 N 行代码"
         },
+        "moodBackground.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "TypeSafe (jev) API Key。留空则尝试读取环境变量 TYPESAFE_API_KEY，都不可用时降级为 Copilot LLM 分析"
+        },
+        "moodBackground.model": {
+          "type": "string",
+          "default": "jev-latest",
+          "description": "TypeSafe 评估使用的模型（如 jev-latest）"
+        },
+        "moodBackground.apiEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "TypeSafe API 地址（留空使用官方默认 https://api.typesafe.ai）"
+        },
         "moodBackground.transitionDuration": {
           "type": "number",
           "default": 1.5,
